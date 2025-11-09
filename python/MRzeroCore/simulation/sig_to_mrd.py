@@ -114,7 +114,8 @@ def sig_to_mrd(
             acq_labels = {key: int(value[n_acq]) for key, value in labels.items()}
 
             if (
-                acq_labels.get("SET", 0) != 0 or acq_labels.get("SET", 0) != n_set
+                acq_labels.get("SET", 0) != 0 
+                or acq_labels.get("SET", 0) != n_set
             ) and verbose > 1:
                 print(
                     f"Pulseq SET label ({acq_labels.get('SET', 0)}) does not match segment index ({n_set}). Overwrite with segment index."

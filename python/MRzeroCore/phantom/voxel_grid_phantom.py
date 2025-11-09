@@ -538,8 +538,11 @@ class VoxelGridPhantom:
         plt.colorbar()
 
         plt.subplot(rows, cols, 9)
-        plt.title("coil sens")
-        imshow(torch.abs(self.coil_sens[0, :, :, s]), vmin=0)
+        plt.title("comb. coil sens")
+        _data = torch.abs(self.coil_sens[:, :, :, s])
+        _data = _data[..., None] if _data.ndim == 3 else _data
+        imshow(_data)
+        #imshow(_tile_stack(torch.abs(self.coil_sens[:, :, :, s])))
         plt.colorbar()
 
         # Conditionally plot masks if plot_masks is True
@@ -619,3 +622,6 @@ def _load_tensor_from_mat(file_name: str) -> torch.Tensor:
         raise Exception("The loaded mat file must contain exactly one array")
 
     return torch.from_numpy(arrays[0]).float()
+
+        
+
