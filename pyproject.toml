@@ -8,6 +8,7 @@ description = "Core functionality of MRzero"
 authors = [
     {name = "Jonathan Endres", email = "jonathan.endres@uk-erlangen.de"},
 ]
+version = 1.0.0
 readme = "README.md"
 classifiers = [
     "Programming Language :: Rust",
@@ -37,3 +38,4 @@ profile = "release"
 strip = true
 module-name = "MRzeroCore._prepass"
 python-source = "python"
+
