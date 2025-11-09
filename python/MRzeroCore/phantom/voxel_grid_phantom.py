@@ -7,6 +7,7 @@ import torch
 import matplotlib.pyplot as plt
 from .sim_data import SimData
 from ..util import imshow
+from .coil import Coil
 
 
 def sigmoid(trajectory: torch.Tensor, nyquist: torch.Tensor) -> torch.Tensor:
@@ -292,6 +293,30 @@ class VoxelGridPhantom:
             coil_sens=torch.ones(1, *data.shape[:-1]),
             size=torch.as_tensor(size),
         )
+    
+    def add_coil(
+        self,
+        coil_radius: Optional[float] = None,
+        num_channels: int = 32,
+        num_rings: int = 4,
+        loop_radius: float = 0.02,
+        ring_spacing: float = 0.05,
+    ):
+        if coil_radius is None:
+            coil_radius = self.size[0].item() + 0.02
+            
+        self.coil = Coil(
+            coil_radius=coil_radius,
+            num_channels=num_channels,
+            num_rings=num_rings,
+            ring_spacing=ring_spacing,
+            loop_radius=loop_radius,
+        )
+
+        self.coil_sens = self.coil.get_sensitivity_maps(
+            matrix_size=self.PD.shape,
+            fov=self.size
+        )
 
     def slices(self, slices: list[int]) -> VoxelGridPhantom:
         """Generate a copy that only contains the selected slice(s).
@@ -513,8 +538,11 @@ class VoxelGridPhantom:
         plt.colorbar()
 
         plt.subplot(rows, cols, 9)
-        plt.title("coil sens")
-        imshow(torch.abs(self.coil_sens[0, :, :, s]), vmin=0)
+        plt.title("comb. coil sens")
+        _data = torch.abs(self.coil_sens[:, :, :, s])
+        _data = _data[..., None] if _data.ndim == 3 else _data
+        imshow(_data)
+        #imshow(_tile_stack(torch.abs(self.coil_sens[:, :, :, s])))
         plt.colorbar()
 
         # Conditionally plot masks if plot_masks is True
@@ -594,3 +622,6 @@ def _load_tensor_from_mat(file_name: str) -> torch.Tensor:
         raise Exception("The loaded mat file must contain exactly one array")
 
     return torch.from_numpy(arrays[0]).float()
+
+        
+
