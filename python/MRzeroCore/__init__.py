@@ -1,4 +1,7 @@
+from importlib.metadata import version, PackageNotFoundError
+
 import numpy
+
 if not hasattr(numpy, "int"):
     numpy.int = int
 if not hasattr(numpy, "float"):
@@ -6,14 +9,25 @@ if not hasattr(numpy, "float"):
 if not hasattr(numpy, "complex"):
     numpy.complex = complex
 
+try:
+    __version__ = version("mrzerocore")
+except PackageNotFoundError:
+    __version__ = "0.0.0"
+
 from .sequence import PulseUsage, Pulse, Repetition, Sequence, chain
 from .phantom.voxel_grid_phantom import VoxelGridPhantom
 from .phantom.custom_voxel_phantom import CustomVoxelPhantom
 from .phantom.sim_data import SimData
 from .phantom.brainweb import generate_brainweb_phantoms
+from .phantom.nifti_phantom import (
+    NiftiPhantom, NiftiTissue, NiftiRef, NiftiMapping, ResliceConfig,
+    BiftiPhantom, BiftiTissue, ResliceTo, Patient, PhantomUnits, PhantomSystem,
+)
+from .phantom.tissue_dict import TissueDict
 from .simulation.isochromat_sim import isochromat_sim
-from .simulation.pre_pass import compute_graph, compute_graph_ext, Graph
+from .simulation.pre_pass import compute_graph, compute_graph_ext, merge_graphs, Graph
 from .simulation.main_pass import execute_graph
+from .simulation.fid_graph import fid_graph
 from .simulation.sig_to_mrd import sig_to_mrd
 from .reconstruction import reco_adjoint
 from .pulseq.exporter import pulseq_write_cartesian

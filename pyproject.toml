@@ -3,36 +3,54 @@ requires = ["maturin>=1.5,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "MRzeroCore"
+name = "mrzerocore"
+version = "1.6.1"
 description = "Core functionality of MRzero"
 authors = [
     {name = "Jonathan Endres", email = "jonathan.endres@uk-erlangen.de"},
 ]
-version = "1.0.0"
+
 readme = "README.md"
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
     "Programming Language :: Python :: Implementation :: PyPy",
     "License :: OSI Approved :: GNU Affero General Public License v3",
 ]
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
-    "ismrmrd",
+    "bifti>=0.4.0",
     "matplotlib>=3.5",
+    "nibabel>=5.2",
+    "numpy>=1.22",
     "pydisseqt>=0.1.13",
     "pypulseq",
     "requests>=2.20",
-    "scikit-image",
     "scipy>=1.7",
-    "torchkbnufft",
     "torch>=1.12",
     "tqdm",
 ]
 
+# --- OPTIONAL INSTALLS ---
+[project.optional-dependencies]
+# to select pypulseq 1.4 or <1.5 use pip install mrzerocore[pp14]
+pp15 = ["pypulseq"]
+# ISMRMRD export (mr0.sig_to_mrd); optional because h5py lacks wheels for some environments
+mrd = ["ismrmrd>=1.14.1"]
+# Not used by MRzeroCore itself, only by some of the playground notebooks
+playground = ["scikit-image", "torchkbnufft"]
+
 [project.urls]
 Repository = "https://github.com/MRsources/MRzero-Core"
-Documentation = "https://mrzero-core.readthedocs.io/"
+Documentation = "https://mrsources.github.io/MRzero-Core/"
 MRzero-Paper = "https://arxiv.org/abs/2002.04265"
 
 [tool.maturin]
@@ -40,5 +58,4 @@ profile = "release"
 strip = true
 module-name = "MRzeroCore._prepass"
 python-source = "python"
-
 

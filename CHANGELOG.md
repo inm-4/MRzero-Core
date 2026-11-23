@@ -1,3 +1,116 @@
+- 1.6.1
+  - fix: update pulseq-rs to 0.3.1, the phase of the `rf_shims` extension is no longer multiplied by 2π (it is already given in rad)
+- 1.6.0
+  - `Sequence.import_file` (`backend="pulseq_rs"`) can split each RF pulse into several instantaneous sub-pulses, as in pulseqzero's `to_mr0`: new arguments `samples_offres` (pulses with a frequency offset), `samples_slicesel` (pulses with a gradient in the block) and `samples_onres` (all other pulses), default `1` (previous behaviour). The `pydisseqt` backend ignores them with a warning
+  - fix: the RF frequency offset is applied as a phase ramp over the sub-pulses, the phase offset refers to the pulse center
+  - fix: the ADC phase of `import_pulseq_rs` now includes the ADC frequency offset (`sample_phases()` only contained the phase offset)
+  - fix: the gradient during an RF pulse (`pulse.grad`) is sampled from the gradient shape at the (sub-)pulse center instead of using only its amplitude
+  - `pulse.freq_offset` and `pulse.duration` are stored as tensors; `pulse.duration` is the duration of one sub-pulse
+- 1.5.0
+  - **breaking:** `VoxelGridPhantom.build()` uses the full affine including its translation instead of always centering the phantom. NIfTI phantoms loaded with `TissueDict.load` therefore sit where their affine says: the NIfTI affine without `reslice_to`, the `reslice_to` affine without `move_to`, otherwise the `move_to` affine; `slices()` keeps the world position of the selected slices
+  - support `reslice_to.move_to` (requires `bifti>=0.4.0`): `"center"` puts voxel `n // 2` at the isocenter (the previous behaviour), an affine places the grid exactly there
+  - `VoxelGridPhantom.slices`, `interpolate`, `scale_fft` and setting `size` emit a `UserWarning`: the BIfTI config should describe the simulated phantom, use `reslice_to` instead
+  - `VoxelGridPhantom.load` / `load_mat` build a centered affine (voxel `n // 2` at the origin, new helper `center_affine`), so these phantoms are placed as before; `interpolate`, `scale_fft` and the `size` setter keep the center voxel in place
+- 1.4.0
+  - requires Python >= 3.10 again (was >= 3.12), now that `bifti` 0.3.1 supports Python 3.10; tested on Python 3.10 - 3.15
+  - `scikit-image` and `torchkbnufft` are no longer installed by default (they are not used by MRzeroCore itself); install them with `pip install mrzerocore[playground]`
+  - `ismrmrd` is now an optional dependency, only needed for `sig_to_mrd`: install it with `pip install mrzerocore[mrd]`. Without it, `sig_to_mrd` raises an `ImportError`; everything else works. This avoids building `h5py` from source where no wheels exist (e.g. Python 3.15)
+  - `numpy` is now a declared dependency; minimum versions: `bifti>=0.3.1`, `nibabel>=5.2`, `numpy>=1.22`, `ismrmrd>=1.14.1` (with `[mrd]`)
+- 1.3.0
+  - use the official [`bifti`](https://pypi.org/project/bifti/) package for BIfTI phantoms instead of the internal implementation (#201). `NiftiPhantom`, `NiftiTissue` and `ResliceConfig` are now aliases of `bifti.BiftiPhantom`, `bifti.BiftiTissue` and `bifti.ResliceTo`; `TissueDict.load` uses the `bifti` loader (density-weighted resampling, `patient` position support, complex B1 maps, `func` mappings are parsed instead of `eval`ed)
+  - `TissueDict.save` uses `bifti.NumpyPhantom.save`: NIfTIs are named `<json name>_<property>.nii.gz` (e.g. `phantom_B1plus_0.nii.gz`) and stored as float64 / complex128; the `.json` no longer contains `reslice_to`
+  - requires Python >= 3.12 (required by `bifti`)
+- 1.2.0
+  - fix: phantoms with zero size along an axis (2D, single voxel) no longer crash the prepass with `Encountered a NaN while sorting + dists by mag` when simulating normalized-gradient sequences; such axes are not scaled
+  - add `fid_graph`: builds a graph with only `z0` and one `+` state per repetition, as an alternative to `compute_graph` without running the prepass
+  - fix: `import_pulseq_rs` stores `pulse.freq_offset` in Hz, matching the pydissect importer (was rad/s) (#197)
+  - speed up `import_pulseq_rs` by integrating gradient moments in NumPy instead of once per event, ~4-13x faster on typical sequences (#194)
+  - fix: cast values to native Python floats before writing the MRD header, so the XML no longer contains `np.float64(...)` (#189)
+  - fix: update pulseq-rs for full rotation extension support and soft-delay default
+- 1.1.2
+  - fix: diffusion for z states was missing a (2pi)² in the b-value computation
+- 1.1.1
+  - `VoxelGridPhantom.build()`: voxel positions are always centered around the origin (index offset `- n // 2`); the affine translation is no longer applied, only rotation and scaling
+- 1.1.0
+  - `compute_graph` accepts `tissues`: with more than one tissue the prepass is run once per tissue and the graphs are unioned with the mean-tissue graph. Omit `tissues`, or pass a single tissue, and the call is the previous mean-relaxation prepass
+- 1.0.9
+  - Fix pulseq importer: correct handling of gradients in RF block that are not slice selection gradients
+- 1.0.8
+  - `util.pulseq_plot` defaults to a stacked six-row figure (`stacked=True`) on pypulseq 1.5, 1.4 and pre-1.4
+  - stacked plots use a doubled figure height so the six rows stay readable
+  - `stacked=False` restores the previous two-figure RF/ADC + gradient layout
+- 1.0.7
+  - `util.pulseq_plot` now wraps native pypulseq 1.5 plot (figure handles, `clear`, `t_adc`)
+- 1.0.6
+  - Replace `VoxelGridPhantom.size` attribute with a property that sets `affine` correctly
+- 1.0.5
+  - fix .seq soft-delays: default to 0.0 for missing values, add documentation
+- 1.0.4
+  - speed up new pulseq importer by bisecting time ranges instead of linear search
+- 1.0.3
+  - Bugfix: convert phantom size to torch tensor
+- 1.0.2
+  - `VoxelGridPhantom.interpolate`/`.slices()` now update the affine matrix
+    (and object size) to stay consistent with the new affine standard (#176)
+- 1.0.1
+  - better handling of pulses with undefined usage in get_kspace: guess based on flip angle
+- 1.0.0
+  - pulseq 1.5 support: `backend="pulseq_rs"` is now the default for `Sequence.import_file`
+  - removed pypulseq version restriction (previously pinned to < 1.5)
+  - fix sign in simulation phase, adjoint reco and playground notebooks
+  - switched FFT to IFFT in all playground/documentation notebooks
+  - DSV support via dsv2pulseq (optional dependency)
+  - NIfTI phantom support: new `TissueDict` and NIfTI phantom classes for
+    loading/saving phantoms in NIfTI format (#154)
+  - added `__version__` attribute to the package (#178)
+- 0.4.12
+  - Use off-resonance pulse properties in new 1.5 importer as well
+- 0.4.11
+  - Add pulse properties for off-resonance
+- 0.4.9 & 0.4.10
+  - Fix ismrmrd export
+- 0.4.8
+  - New `backend="pulseq_rs"` option on `Sequence.import_file` that parses
+    `.seq` files through [pulseq-rs](https://github.com/pulseq-frame/pulseq-rs)
+    via new PyO3 bindings in the `_prepass` extension; default backend
+    remains `pydisseqt`. Forwards `larmor_hz`, `fov_scale`, `fov_pos`,
+    `fov_rot`, and `soft_delays` to the pulseq-rs interpreter.
+  - New `Sequence.get_adc_labels(name)` returns the pulseq label
+    (`lin`, `par`, `seg`, `slc`, …) for every measured ADC sample as a 1-D
+    `int32` tensor — useful for reconstruction.
+  - New `Sequence.get_label_changes(name)` returns `(rep_index, value)`
+    pairs at each per-repetition label transition, for splitting a
+    sequence on label state. Raises if a single repetition has ADC
+    samples with multiple distinct values for the label.
+  - `Repetition` gained an `adc_labels: dict[str, torch.Tensor]` attribute
+    populated by the pulseq-rs backend; empty for the pydisseqt backend.
+- 0.4.7
+  - Bumped minimum Python to 3.10
+  - Added `pp14` extra (`pip install mrzerocore[pp14]`) that pins
+    `pypulseq < 1.5`
+  - Bugfix: removed a double degrees→radians conversion in the
+    `mr0_TSE_2D_multi_shot_seq` playground notebook
+- 0.4.6
+  - Small bugfixes
+  - restrict pypulseq dependency to < 1.5.0
+- 0.4.5
+  - Fix: NIfTI loader supports `int` constants
+  - Fix: Empty tissue masks in `VoxelGridPhantom`
+- 0.4.4
+  - Fix: support for empty tissue masks in NIfTI phantom
+  - Fix: support for int - constants in NIfTI phantom
+  - Remove unsupported platforms from build (32bit windows, intel mac)
+- 0.4.3
+  - Fix python package normalization
+- 0.4.2
+  - Add NIfTI phantom support
+  - Fix custom voxel phantom plot
+  - Make isochromat sim GPU compatible
+- 0.4.0
+  - Integrate ISMRMD exporter
+  - Update documentation
+  - Provide option to get PDG graph plotting data without plotting
+  - Helper plotting function that works with all pulseq versions
 - 0.3.13
   - bugfix: util.load_phantom - B0_polynomial computation used wrong number of dims
   - default `clear_state_mag` to `True` to avoid memory problems

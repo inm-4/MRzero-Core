@@ -1,14 +1,83 @@
 from __future__ import annotations
+import bisect
 from time import time
+import warnings
 import torch
 import numpy as np
 from enum import Enum
-from typing import Iterable, Optional
+from typing import Iterable, Literal, Optional
 import matplotlib.pyplot as plt
 
 # TODO: if everything is working, deprecate old pulseq loader
 from .pulseq.pulseq_loader import intermediate, PulseqFile, Adc, Spoiler
-import pydisseqt
+
+
+def _gradient_cumulative(g, times=None):
+    """Moment from the start of ``g``'s shape to a shape-relative time.
+
+    The returned function matches ``g.integrate(0, s)`` for an array of times,
+    so an interval moment is a difference of two evaluations. Piecewise-linear
+    trapezoids are integrated in NumPy instead of one PyO3 call per event.
+    """
+    duration = float(g.shape_duration)
+    scale = float(g.amp)
+    if times is None:
+        times = g.shape_times()
+    t = np.asarray(times, dtype=np.float64)
+    a = np.asarray(g.shape_amp(), dtype=np.float64)
+    zeros = lambda s: np.zeros(np.shape(s), dtype=np.float64)
+    if t.size == 0 or duration <= 0.0 or scale == 0.0:
+        return zeros
+    if t.size == 1:
+        slope = scale * float(a[0])
+
+        def cum_const(s, slope=slope, duration=duration):
+            s = np.clip(np.asarray(s, dtype=np.float64), 0.0, duration)
+            return slope * s
+
+        return cum_const
+
+    # Hold the endpoint amplitude on [0, first] and [last, duration], matching
+    # Shape::interpolate outside the stored samples.
+    if t[0] > 0.0:
+        t = np.concatenate(([0.0], t))
+        a = np.concatenate(([a[0]], a))
+    if t[-1] < duration:
+        t = np.concatenate((t, [duration]))
+        a = np.concatenate((a, [a[-1]]))
+    if t.size > 1 and np.any(np.diff(t) <= 0.0):
+        keep = np.empty(t.size, dtype=bool)
+        keep[0] = True
+        keep[1:] = np.diff(t) > 0.0
+        t = t[keep]
+        a = a[keep]
+    if t.size < 2:
+        slope = scale * float(a[0]) if a.size else 0.0
+
+        def cum_flat(s, slope=slope, duration=duration):
+            s = np.clip(np.asarray(s, dtype=np.float64), 0.0, duration)
+            return slope * s
+
+        return cum_flat
+
+    prefix = np.empty(t.size, dtype=np.float64)
+    prefix[0] = 0.0
+    np.cumsum(0.5 * (a[:-1] + a[1:]) * np.diff(t), out=prefix[1:])
+    prefix *= scale
+    a = a * scale
+
+    def cum(s, t=t, a=a, prefix=prefix, duration=duration):
+        s = np.clip(np.asarray(s, dtype=np.float64), 0.0, duration)
+        idx = np.clip(np.searchsorted(t, s, side="right") - 1, 0, t.size - 2)
+        t0 = t[idx]
+        t1 = t[idx + 1]
+        a0 = a[idx]
+        width = t1 - t0
+        frac = np.divide(s - t0, width, out=np.zeros_like(s), where=width > 0.0)
+        v = a0 + (a[idx + 1] - a0) * frac
+        return prefix[idx] + 0.5 * (a0 + v) * (s - t0)
+
+    return cum
 
 
 class PulseUsage(Enum):
@@ -55,6 +124,16 @@ class Pulse:
         Flip angle in radians
     phase : torch.Tensor
         Pulse phase in radians
+    pulse_freq: torch.Tensor, to be removed in the future!
+        pulse frequency omega_1 = angle/duration
+    freq_offset: torch.Tensor
+        Frequency offset in Hz
+	duration: torch.Tensor
+		pulse duration in seconds
+	grad: torch.Tensor (dim=3)
+		gradient during the pulse in Hz/m per channel (x,y,z)
+    off_ress: bool
+        Specifies if the pulse should be simulated with the off-resonance treatment        
     shim_array : torch.Tensor
         Contains B1 mag and phase, used for pTx. 2D tensor([[1, 0]]) for 1Tx.
     selective : bool
@@ -66,6 +145,13 @@ class Pulse:
         usage: PulseUsage,
         angle: torch.Tensor,
         phase: torch.Tensor,
+        
+        pulse_freq: torch.Tensor, # to be removed in the future
+        freq_offset: torch.Tensor,
+        duration: torch.Tensor,
+        grad: torch.Tensor,
+        off_res: bool,
+        
         shim_array: torch.Tensor,
         selective: bool,
     ):
@@ -73,6 +159,13 @@ class Pulse:
         self.usage = usage
         self.angle = angle
         self.phase = phase
+        
+        self.pulse_freq = pulse_freq # to be removed in the future
+        self.freq_offset = freq_offset
+        self.duration = duration
+        self.grad = grad
+        self.off_res = off_res
+        
         self.shim_array = shim_array
         self.selective = selective
 
@@ -82,6 +175,13 @@ class Pulse:
             self.usage,
             torch.as_tensor(self.angle, dtype=torch.float32).cpu(),
             torch.as_tensor(self.phase, dtype=torch.float32).cpu(),
+            
+            torch.as_tensor(self.pulse_freq, dtype=torch.float32).cpu(), # to be removed in the future
+            torch.as_tensor(self.freq_offset, dtype=torch.float32).cpu(),
+            torch.as_tensor(self.duration, dtype=torch.float32).cpu(),
+            torch.as_tensor(self.grad, dtype=torch.float32).cpu(),
+            self.off_res,
+            
             torch.as_tensor(self.shim_array, dtype=torch.float32).cpu(),
             self.selective
         )
@@ -92,6 +192,13 @@ class Pulse:
             self.usage,
             torch.as_tensor(self.angle, dtype=torch.float32).cuda(device),
             torch.as_tensor(self.phase, dtype=torch.float32).cuda(device),
+            
+            torch.as_tensor(self.pulse_freq, dtype=torch.float32).cuda(device), # to be removed in the future
+            torch.as_tensor(self.freq_offset, dtype=torch.float32).cuda(device),
+            torch.as_tensor(self.duration, dtype=torch.float32).cuda(device),
+            torch.as_tensor(self.grad, dtype=torch.float32).cuda(device),
+            self.off_res,
+            
             torch.as_tensor(self.shim_array, dtype=torch.float32).cuda(device),
             self.selective
         )
@@ -108,6 +215,11 @@ class Pulse:
             PulseUsage.UNDEF,
             torch.zeros(1, dtype=torch.float32),
             torch.zeros(1, dtype=torch.float32),
+            torch.zeros(1, dtype=torch.float32), # to be removed in the future
+            torch.zeros(1, dtype=torch.float32),
+            torch.zeros(1, dtype=torch.float32),
+            torch.zeros(3, dtype=torch.float32),
+            False,
             torch.asarray([[1, 0]], dtype=torch.float32),
             True
         )
@@ -118,6 +230,13 @@ class Pulse:
             self.usage,
             self.angle.clone(),
             self.phase.clone(),
+            
+            self.pulse_freq.clone(), # to be removed in the future
+            self.freq_offset.clone(),
+            self.duration.clone(),
+            self.grad.clone(),
+            self.off_res,
+            
             self.shim_array.clone(),
             self.selective
         )
@@ -190,6 +309,11 @@ class Repetition:
         self.gradm = gradm
         self.adc_phase = adc_phase
         self.adc_usage = adc_usage
+        # Per-event integer labels (pulseq LABELSET/LABELINC state at the time
+        # each ADC fires). Populated by the pulseq_rs importer; empty otherwise.
+        # Each tensor has shape (event_count,); values at non-ADC events are
+        # meaningless and should be masked by adc_usage > 0.
+        self.adc_labels: dict[str, torch.Tensor] = {}
 
     def cuda(self, device: int | None = None) -> Repetition:
         """Move this repetition to the specified CUDA device and return it."""
@@ -336,6 +460,11 @@ class Sequence(list):
                 k_pos = -k_pos
             elif rep.pulse.usage == PulseUsage.STORE:
                 stored = k_pos
+            else: # undef or fatsat
+                if abs(rep.pulse.angle) < 100 * np.pi / 180:
+                    k_pos = stored  # excit
+                else:
+                    k_pos = -k_pos  # refoc
 
             rep_traj = k_pos + torch.cumsum(
                 torch.cat([rep.gradm, rep.event_time[:, None]], 1),
@@ -415,6 +544,96 @@ class Sequence(list):
         """Calculate the total duration of self in seconds."""
         return sum(rep.event_time.sum().item() for rep in self)
 
+    def get_adc_labels(self, name: str) -> torch.Tensor:
+        """Return the values of a pulseq label for every measured ADC sample.
+
+        The label is read from each event with ``adc_usage > 0`` and the
+        result is concatenated across all repetitions, giving a 1-D
+        ``int32`` tensor whose length equals the total number of measured
+        samples in the sequence. Useful for reconstruction code that needs
+        the per-sample ``lin`` / ``par`` / ``slc`` / … indices.
+
+        Parameters
+        ----------
+        name : str
+            Label name as used by pulseq: one of ``"slc"``, ``"seg"``,
+            ``"rep"``, ``"avg"``, ``"set"``, ``"eco"``, ``"phs"``, ``"lin"``,
+            ``"par"``, ``"acq"`` (counters), or ``"nav"``, ``"rev"``,
+            ``"sms"``, ``"ref"``, ``"ima"``, ``"off"``, ``"noise"`` (flags,
+            returned as ``0`` / ``1``).
+
+        Raises
+        ------
+        KeyError
+            If the sequence has no labels (i.e. it wasn't imported with the
+            ``pulseq_rs`` backend) or the requested name doesn't exist.
+        """
+        chunks: list[torch.Tensor] = []
+        for rep in self:
+            if name not in rep.adc_labels:
+                raise KeyError(
+                    f"label {name!r} not available on this sequence; ensure "
+                    f"it was imported with backend='pulseq_rs'"
+                )
+            mask = rep.adc_usage > 0
+            chunks.append(rep.adc_labels[name][mask])
+        if not chunks:
+            return torch.zeros(0, dtype=torch.int32)
+        return torch.cat(chunks)
+
+    def get_label_changes(self, name: str) -> list[tuple[int, int]]:
+        """Return repetition-wise changes of a pulseq label.
+
+        Walks the sequence in order, collapses each repetition to the single
+        value of ``name`` across all of its ADC samples, and emits a
+        ``(rep_index, new_value)`` pair whenever that value differs from the
+        previous one. The first repetition that carries an ADC is always
+        emitted as the baseline.
+
+        Repetitions without any ADC are skipped (they have no opinion on
+        the label state). If a single repetition contains ADCs with
+        different values for ``name``, this is treated as illegal — the
+        intended use case is splitting the sequence on label changes, which
+        requires one value per repetition.
+
+        Parameters
+        ----------
+        name : str
+            See :meth:`get_adc_labels`.
+
+        Raises
+        ------
+        ValueError
+            If any repetition contains multiple distinct values for ``name``
+            among its ADC samples.
+        KeyError
+            If the label is not available on this sequence.
+        """
+        changes: list[tuple[int, int]] = []
+        prev: Optional[int] = None
+        for i, rep in enumerate(self):
+            if name not in rep.adc_labels:
+                raise KeyError(
+                    f"label {name!r} not available on this sequence; ensure "
+                    f"it was imported with backend='pulseq_rs'"
+                )
+            mask = rep.adc_usage > 0
+            if not mask.any():
+                continue
+            vals = rep.adc_labels[name][mask]
+            uniq = torch.unique(vals)
+            if uniq.numel() != 1:
+                raise ValueError(
+                    f"label {name!r} has multiple values "
+                    f"{uniq.tolist()} within repetition {i}; cannot collapse "
+                    f"to a single per-rep value"
+                )
+            v = int(uniq.item())
+            if v != prev:
+                changes.append((i, v))
+                prev = v
+        return changes
+
     @classmethod
     def import_file(cls, file_name: str,
                     exact_trajectories: bool = True,
@@ -422,6 +641,16 @@ class Sequence(list):
                     default_shim: torch.Tensor = torch.asarray([[1, 0]], dtype=torch.float32),
                     ref_voltage: float = 300.0,
                     resolution: Optional[int] = None,
+                    backend: Literal["pydisseqt", "pulseq_rs"] = "pulseq_rs",
+                    larmor_hz: Optional[float] = None,
+                    fov_scale: Optional[float] = None,
+                    fov_pos: Optional[tuple[float, float, float]] = None,
+                    fov_rot: Optional[tuple[float, float, float, float]] = None,
+                    soft_delays: Optional[dict[str, float]] = None,
+                    output_dir: Optional[str] = None,
+                    samples_offres: int = 1,
+                    samples_slicesel: int = 1,
+                    samples_onres: int = 1,
                     ) -> Sequence:
         """Import a pulseq .seq file or a bundle of .dsv files.
 
@@ -441,22 +670,105 @@ class Sequence(list):
             The shim_array used for pulses that do not specify it themselves.
         ref_voltage : float
             If a .dsv file is imported, this is used to convert pulses from
-            volts to angles. A 1 ms block pulse of ref_voltage is a 180 ° flip
+            volts to angles. Make sure to use 1Tx systems for dsv simulation, 
+            otherwise the ref_voltage will not match to the concerted flip angle!!
+            A 1 ms block pulse of ref_voltage is a 180 ° flip
         resolution : int | None
             .dsv files do not contain data for the number of ADC samples.
             This is used to specify the number of samples per ADC block.
             If false, uses the .dsv time step as ADC dwell time
+        backend : "pydisseqt" | "pulseq_rs"
+            Parser used to read the .seq file. ``"pydisseqt"`` (default) is the
+            legacy path. ``"pulseq_rs"`` uses the Rust pulseq-rs parser via the
+            bundled extension; .dsv files always fall back to pydisseqt.
+        larmor_hz : float | None
+            Larmor frequency in Hz used by the pulseq-rs interpreter. If None,
+            uses the interpreter's default (Water @ 3T). Used for ppm units.
+        fov_scale : float | None
+            Uniform scale factor applied to the FOV. Defaults to 1.0.
+        fov_pos : tuple[float, float, float] | None
+            FOV offset (x, y, z), applied after scaling. Defaults to (0, 0, 0).
+        fov_rot : tuple[float, float, float, float] | None
+            FOV rotation as a quaternion (w, x, y, z). Defaults identity rot.
+        soft_delays : dict[str, float] | None
+            Mapping of soft delay names to duration overrides in seconds.
+        output_dir : str | None
+            Directory the converted .seq file is written to when importing a
+            .dsv file. Only used for ``backend="pydisseqt"`` with .dsv input.
+        samples_offres, samples_slicesel, samples_onres : int
+            Number of instantaneous sub-pulses per RF pulse, as in pulseqzero's
+            ``to_mr0``: ``samples_offres`` for pulses with a frequency offset,
+            else ``samples_slicesel`` if the block contains a gradient, else
+            ``samples_onres``. Only supported by ``backend="pulseq_rs"``.
 
         Returns
         -------
         mr0.Sequence
             The imported file as mr0 Sequence
         """
+        if not file_name.endswith(".seq") and backend == "pulseq_rs":
+            warnings.warn(
+                "pulseq_rs backend only supports .seq files; falling back "
+                "to pydisseqt for DSV input.",
+                stacklevel=2,
+            )
+            backend = "pydisseqt"
+
+        if backend == "pulseq_rs":
+            return cls._import_pulseq_rs(
+                file_name, exact_trajectories, print_stats, default_shim,
+                larmor_hz=larmor_hz, fov_scale=fov_scale,
+                fov_pos=fov_pos, fov_rot=fov_rot, soft_delays=soft_delays,
+                samples_offres=samples_offres, samples_slicesel=samples_slicesel,
+                samples_onres=samples_onres,
+            )
+        elif backend == "pydisseqt":
+            if (samples_offres, samples_slicesel, samples_onres) != (1, 1, 1):
+                warnings.warn(
+                    "pydisseqt backend does not support sub-pulses; "
+                    "samples_offres / samples_slicesel / samples_onres are ignored.",
+                    stacklevel=2,
+                )
+            return cls._import_pydisseqt(
+                file_name, exact_trajectories, print_stats, default_shim,
+                ref_voltage, resolution, output_dir
+            )
+        else:
+            raise ValueError(
+                f"unknown backend {backend!r}; expected 'pydisseqt' or 'pulseq_rs'"
+            )
+
+    @classmethod
+    def _import_pydisseqt(cls, file_name: str,
+                          exact_trajectories: bool,
+                          print_stats: bool,
+                          default_shim: torch.Tensor,
+                          ref_voltage: float,
+                          resolution: Optional[int],
+                          output_dir: Optional[str],
+                          ) -> Sequence:
+        import pydisseqt
+
         start = time()
         if file_name.endswith(".seq"):
             parser = pydisseqt.load_pulseq(file_name)
         else:
-            parser = pydisseqt.load_dsv(file_name, ref_voltage, resolution)
+            #try import of from dsv2pulseq import read_dsv
+            try:
+                from dsv2pulseq import read_dsv
+                import os
+            except ImportError:
+                raise ImportError(
+                    "To import .dsv files, please install the dsv2pulseq package"
+                )
+            seq_temp = read_dsv(file_name, ref_volt=ref_voltage)
+            os.makedirs(output_dir, exist_ok=True)
+            seq_name = os.path.basename(file_name) + '_dsv2seq.seq'
+            seq_dsv_path = os.path.join(output_dir, seq_name)
+            _ = seq_temp.make_pulseq_sequence(seq_dsv_path)
+            print(f"Saved .seq file to: {seq_dsv_path}")
+            parser = pydisseqt.load_pulseq(seq_dsv_path)
+
         if print_stats:
             print(f"Importing the .seq file took {time() - start} s")
         start = time()
@@ -488,6 +800,10 @@ class Sequence(list):
             # Fetch additional data needed for building the mr0 sequence
             pulse = parser.integrate_one(pulses[i][0], pulses[i][1]).pulse
             shim = parser.sample_one(rep_start).pulse.shim
+            
+            # load pulse frequency-offset needed for potential treatment off off-resonance
+            frequency = parser.sample_one(rep_start).pulse.amplitude # this only works for block pulses! should be removed in the future
+            frequency_offset = parser.sample_one(rep_start).pulse.frequency
 
             adcs = parser.events("adc", rep_start, rep_end)
 
@@ -549,17 +865,23 @@ class Sequence(list):
                 )
 
             # -- Now we build the mr0 Sequence repetition --
-
             rep = seq.new_rep(event_count)
+            rep.event_time[:] = torch.as_tensor(np.diff(abs_times))
+            
             rep.pulse.angle = pulse.angle
-            rep.pulse.phase = pulse.phase
+            rep.pulse.phase = pulse.phase                       
+            
+            # provide frequency and frequency-offset to pulse object needed for potential treatment off off-resonance
+            rep.pulse.pulse_freq = 2*torch.pi * frequency # rad/s # may only work for block-pulses
+            rep.pulse.freq_offset = frequency_offset      # Hz
+            if rep.pulse.freq_offset != 0:
+                 rep.pulse.off_res = True
+            
             rep.pulse.usage = pulse_usage(pulse.angle)
             if shim is None:
                 rep.pulse.shim_array = default_shim.clone()
             else:
                 rep.pulse.shim_array = torch.as_tensor(shim)
-
-            rep.event_time[:] = torch.as_tensor(np.diff(abs_times))
 
             rep.gradm[:, 0] = torch.as_tensor(moments.gradient.x)
             rep.gradm[:, 1] = torch.as_tensor(moments.gradient.y)
@@ -569,6 +891,266 @@ class Sequence(list):
                 phases = np.pi / 2 - torch.as_tensor(samples.adc.phase)
                 rep.adc_usage[adc_start:adc_start + len(adcs)] = 1
                 rep.adc_phase[adc_start:adc_start + len(adcs)] = phases
+
+        if print_stats:
+            print(f"Converting the sequence to mr0 took {time() - start} s")
+        return seq
+
+    """credits @ Claude"""
+    @classmethod
+    def _import_pulseq_rs(cls, file_name: str,
+                          exact_trajectories: bool,
+                          print_stats: bool,
+                          default_shim: torch.Tensor,
+                          *,
+                          larmor_hz: Optional[float] = None,
+                          fov_scale: Optional[float] = None,
+                          fov_pos: Optional[tuple[float, float, float]] = None,
+                          fov_rot: Optional[tuple[float, float, float, float]] = None,
+                          soft_delays: Optional[dict[str, float]] = None,
+                          samples_offres: int = 1,
+                          samples_slicesel: int = 1,
+                          samples_onres: int = 1,
+                          ) -> Sequence:
+        from . import _prepass  # local import to avoid touching module init order
+
+        start = time()
+        interp = _prepass.load_pulseq_rs(
+            file_name,
+            larmor_hz=larmor_hz,
+            fov_scale=fov_scale,
+            fov_pos=fov_pos,
+            fov_rot=fov_rot,
+            soft_delays=soft_delays,
+        )
+        if print_stats:
+            print(f"Importing the .seq file took {time() - start} s")
+        start = time()
+
+        blocks = list(interp.blocks)
+        duration = interp.duration
+
+        # Per-axis sorted breakpoint times for fast lookups, plus a cumulative
+        # moment function so each repetition is integrated in one NumPy pass.
+        flat_grad_times: dict[str, list[float]] = {"x": [], "y": [], "z": []}
+        grad_cum: dict[str, list] = {"x": [], "y": [], "z": []}
+        grad_origin: dict[str, list[float]] = {"x": [], "y": [], "z": []}
+        grad_end: dict[str, list[float]] = {"x": [], "y": [], "z": []}
+        for b in blocks:
+            for axis in ("x", "y", "z"):
+                g = getattr(b, "g" + axis)
+                if g is None:
+                    continue
+                shape_t = g.shape_times()
+                t_off = b.start + g.delay
+                flat_grad_times[axis].extend(t_off + t for t in shape_t)
+                grad_cum[axis].append(_gradient_cumulative(g, shape_t))
+                grad_origin[axis].append(t_off)
+                grad_end[axis].append(t_off + float(g.shape_duration))
+
+        # Precomputed ADC lists for faster lookup. Label values are stored as
+        # parallel columns so a repetition can slice them instead of reading
+        # one dict per sample.
+        flat_adc_times: list[float] = []
+        flat_adc_phases: list[float] = []
+        label_names: list[str] = []
+        label_cols: dict[str, list[int]] = {}
+        for b in blocks:
+            if b.adc is None:
+                continue
+            lbl = b.adc.labels()
+            ts = b.adc.sample_times()
+            # sample_phases() only contains the phase offset, add the
+            # frequency offset term (time from the start of the block)
+            ph = [p - 2 * np.pi * b.adc.freq * t
+                  for p, t in zip(b.adc.sample_phases(), ts)]
+            flat_adc_times.extend(b.start + t for t in ts)
+            flat_adc_phases.extend(ph)
+            n_samples = len(ts)
+            if lbl is not None and not label_names:
+                label_names = list(lbl.keys())
+                label_cols = {name: [] for name in label_names}
+            if label_names:
+                for name in label_names:
+                    value = int(lbl[name]) if lbl is not None else 0
+                    label_cols[name].extend([value] * n_samples)
+        label_arr = {
+            name: np.asarray(col, dtype=np.int32) for name, col in label_cols.items()
+        }
+
+        def events_axis_in(t0: float, t1: float, axis: str) -> list[float]:
+            times = flat_grad_times[axis]
+            lo = bisect.bisect_left(times, t0)
+            hi = bisect.bisect_right(times, t1)
+            return times[lo:hi]
+
+        def adcs_in(t0: float, t1: float) -> tuple[list[float], list[float], int, int]:
+            lo = bisect.bisect_left(flat_adc_times, t0)
+            hi = bisect.bisect_right(flat_adc_times, t1)
+            return flat_adc_times[lo:hi], flat_adc_phases[lo:hi], lo, hi
+
+        def moments(axis: str, edges: np.ndarray) -> np.ndarray:
+            total = np.zeros(edges.shape[0], dtype=np.float64)
+            origins = grad_origin[axis]
+            ends = grad_end[axis]
+            lo = bisect.bisect_right(ends, float(edges[0]))
+            hi = bisect.bisect_left(origins, float(edges[-1]))
+            cums = grad_cum[axis]
+            for j in range(lo, hi):
+                total += cums[j](edges - origins[j])
+            return np.diff(total)
+
+        seq = cls(normalized_grads=False)
+
+        # Discover RF pulses: each RF-bearing block is split into n instantaneous
+        # sub-pulses at the centers of n equal windows of the shape, as in
+        # pulseqzero's to_mr0. n = 1 places one pulse at the shape center.
+        # (center, pulse_start, pulse_end, block_idx, sub-pulse index, n)
+        pulses: list[tuple[float, float, float, int, int, int]] = []
+        for j, b in enumerate(blocks):
+            if b.rf is None:
+                continue
+            if b.rf.freq != 0:
+                n = samples_offres
+            elif b.gx is not None or b.gy is not None or b.gz is not None:
+                n = samples_slicesel
+            else:
+                n = samples_onres
+            ps = b.start + b.rf.delay
+            pe = ps + b.rf.shape_duration
+            step = b.rf.shape_duration / n
+            for k in range(n):
+                pulses.append((ps + (k + 0.5) * step, ps, pe, j, k, n))
+
+        for i in range(len(pulses)):
+            rep_start, ps, pe, b_idx, k, n = pulses[i]
+            if i + 1 < len(pulses):
+                rep_end = pulses[i + 1][0]
+            else:
+                rep_end = duration
+
+            rf = blocks[b_idx].rf
+            step = rf.shape_duration / n
+            angle, phase = rf.integrate(k * step, (k + 1) * step)
+            # The frequency offset is a phase ramp over the sub-pulses, falling
+            # like the free precession exp(-2πi f t) of the spins it hits.
+            # The phase offset refers to the pulse center.
+            phase -= 2 * np.pi * rf.freq * step * (k - (n - 1) / 2)
+            t_center = rep_start - blocks[b_idx].start  # block-relative
+            if rf.rf_use == "excitation":
+                rf_usage = PulseUsage.EXCIT
+            elif rf.rf_use == "saturation":
+                rf_usage = PulseUsage.FATSAT
+            elif rf.rf_use == "refocusing":
+                rf_usage = PulseUsage.REFOC
+            else:
+                rf_usage = PulseUsage.UNDEF
+            
+            # Gradient amplitude at the sub-pulse center, which follows the
+            # shape (ramps, arbitrary gradients) instead of only its amplitude
+            rf_grad = torch.zeros(3, dtype=torch.float32)
+            rf_hasgrad = False
+            for axis, g in enumerate((blocks[b_idx].gx, blocks[b_idx].gy, blocks[b_idx].gz)):
+                if g is None or g.delay > rf.shape_duration + rf.delay:
+                    continue  # no gradient present during rf
+                rf_hasgrad = True
+                rf_grad[axis] = g.sample(t_center)
+
+            # Shim handling: pulseq-rs always returns a list, with [(1.0, 0.0)]
+            # meaning "no shim" - in that case fall back to the default.
+            shims = rf.shims
+            if (len(shims) == 1
+                    and abs(shims[0][0] - 1.0) < 1e-12
+                    and abs(shims[0][1]) < 1e-12):
+                shim_arr = default_shim.clone()
+            else:
+                shim_arr = torch.as_tensor(shims, dtype=torch.float32)
+
+            adcs, adc_phases, adc_lo, adc_hi = adcs_in(rep_start, rep_end)
+
+            if k < n - 1:
+                # from one sub-pulse center to the next, no ADC during RF
+                abs_times = [rep_start, rep_end]
+                adc_start = None
+            elif exact_trajectories:
+                first = pe
+                last = pulses[i + 1][1] if i + 1 < len(pulses) else rep_end
+                eps = 1e-6
+                precision = 6
+
+                if len(adcs) > 0:
+                    grad_before = sorted({round(t, precision) for t in (
+                        events_axis_in(first + eps, adcs[0] - eps, "x") +
+                        events_axis_in(first + eps, adcs[0] - eps, "y") +
+                        events_axis_in(first + eps, adcs[0] - eps, "z")
+                    )})
+                    grad_after = sorted({round(t, precision) for t in (
+                        events_axis_in(adcs[-1] + eps, last - eps, "x") +
+                        events_axis_in(adcs[-1] + eps, last - eps, "y") +
+                        events_axis_in(adcs[-1] + eps, last - eps, "z")
+                    )})
+                    if i == len(pulses) - 1:
+                        abs_times = [rep_start, first] + grad_before + adcs
+                    else:
+                        abs_times = ([rep_start, first] + grad_before + adcs +
+                                     grad_after + [last, rep_end])
+                    adc_start = 2 + len(grad_before) - 1
+                else:
+                    grad = sorted({round(t, precision) for t in (
+                        events_axis_in(first + eps, last - eps, "x") +
+                        events_axis_in(first + eps, last - eps, "y") +
+                        events_axis_in(first + eps, last - eps, "z")
+                    )})
+                    if i == len(pulses) - 1:
+                        abs_times = [rep_start, first] + grad
+                    else:
+                        abs_times = [rep_start, first] + grad + [last, rep_end]
+                    adc_start = None
+            else:
+                abs_times = [rep_start] + adcs + [rep_end]
+                adc_start = 0
+
+            event_count = len(abs_times) - 1
+
+            if print_stats:
+                print(
+                    f"Rep. {i + 1}: {event_count} samples, of which "
+                    f"{len(adcs)} are ADC (starting at {adc_start})"
+                )
+
+            edges = np.asarray(abs_times, dtype=np.float64)
+            mom_x = moments("x", edges)
+            mom_y = moments("y", edges)
+            mom_z = moments("z", edges)
+
+            rep = seq.new_rep(event_count)
+            rep.pulse.angle = torch.as_tensor(angle)
+            rep.pulse.phase = torch.as_tensor(phase)
+            rep.pulse.usage = rf_usage
+            rep.pulse.shim_array = shim_arr
+            rep.pulse.freq_offset = torch.as_tensor(rf.freq, dtype=torch.float32)
+            rep.pulse.duration = torch.as_tensor(step, dtype=torch.float32)
+            rep.pulse.grad = rf_grad
+            if rep.pulse.freq_offset != 0 or rf_hasgrad:
+                 rep.pulse.off_res = True
+
+            rep.event_time[:] = torch.as_tensor(np.diff(abs_times))
+            rep.gradm[:, 0] = torch.as_tensor(mom_x)
+            rep.gradm[:, 1] = torch.as_tensor(mom_y)
+            rep.gradm[:, 2] = torch.as_tensor(mom_z)
+
+            if adc_start is not None:
+                phases_t = np.pi / 2 - torch.as_tensor(adc_phases)
+                rep.adc_usage[adc_start:adc_start + len(adcs)] = 1
+                rep.adc_phase[adc_start:adc_start + len(adcs)] = phases_t
+
+            if label_names and adc_hi > adc_lo and adc_start is not None:
+                for name in label_names:
+                    t = torch.zeros(event_count, dtype=torch.int32)
+                    t[adc_start:adc_start + (adc_hi - adc_lo)] = torch.from_numpy(
+                        label_arr[name][adc_lo:adc_hi].copy()
+                    )
+                    rep.adc_labels[name] = t
 
         if print_stats:
             print(f"Converting the sequence to mr0 took {time() - start} s")

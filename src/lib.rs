@@ -3,6 +3,7 @@ use pyo3::prelude::*;
 use pyo3::types::*;
 use pyo3::{wrap_pyfunction, PyTraverseError};
 mod pre_pass;
+mod seq_import;
 use pre_pass::{comp_graph, Repetition};
 use std::{collections::HashMap, slice::from_raw_parts, time::Instant};
 
@@ -172,8 +173,11 @@ fn compute_graph<'p>(
     let start = Instant::now();
     println!("Compute Graph");
 
+    // Phantoms without extent along an axis (e.g. 2D or single voxel) would
+    // produce inf scales and 0 * inf = NaN trajectories; don't scale those
+    let inv_size = |s: f32| if s > 0.0 { 1.0 / s } else { 0.0 };
     let grad_scale = if normalized_grads {
-        [1.0 / size[0], 1.0 / size[1], 1.0 / size[2]]
+        [inv_size(size[0]), inv_size(size[1]), inv_size(size[2])]
     } else {
         [1.0, 1.0, 1.0]
     };
@@ -287,6 +291,13 @@ fn compute_graph<'p>(
 fn _prepass(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_graph, m)?)?;
     m.add_class::<PyDistribution>()?;
+
+    m.add_function(wrap_pyfunction!(seq_import::load_pulseq_rs, m)?)?;
+    m.add_class::<seq_import::PyInterpSeq>()?;
+    m.add_class::<seq_import::PyBlock>()?;
+    m.add_class::<seq_import::PyRf>()?;
+    m.add_class::<seq_import::PyGradient>()?;
+    m.add_class::<seq_import::PyAdc>()?;
 
     Ok(())
 }

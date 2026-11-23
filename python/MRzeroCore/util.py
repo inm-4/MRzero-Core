@@ -1,3 +1,4 @@
+import inspect
 import os
 import time
 from typing import Literal, Union, Optional
@@ -8,7 +9,7 @@ import matplotlib.pyplot as plt
 import pypulseq as pp
 
 
-def get_signal_from_real_system(path: str, NRep: int, NCol: int):
+def get_signal_from_real_system(path: str, NRep: int, NRead: int,ncoils = 20, heuristic_shift = 4):
     """Wait for a TWIX file and return its data.
 
     This function assumes 20 recieve coils and a readout with equal number of
@@ -20,14 +21,16 @@ def get_signal_from_real_system(path: str, NRep: int, NCol: int):
         Path to TWIX file
     NRep : int
         Number of repetitions of the measured sequence
-    NCol : int
+    NRead : int
         Number of ADC samples per repetition
 
     Returns
     -------
     torch.tensor
         A (samples x coils) tensor with the signal extracted from the file
-    """
+    """ 
+    
+    
     print('waiting for TWIX file from the scanner... ' + path)
     done_flag = False
     while not done_flag:
@@ -35,33 +38,32 @@ def get_signal_from_real_system(path: str, NRep: int, NCol: int):
             # read twix file
             print("TWIX file arrived. Reading....")
 
-            ncoils = 20
             time.sleep(0.2)
             raw = np.loadtxt(path)
 
-            heuristic_shift = 4
-            expected_size = NRep * ncoils * (NCol + heuristic_shift) * 2
+            expected_size = NRep * ncoils * (NRead + heuristic_shift) * 2
             print(f"raw size: {raw.size}, expected size: {expected_size}")
 
             if raw.size != expected_size:
                 print("get_signal_from_real_system: SERIOUS ERROR, "
                       "TWIX dimensions corrupt, returning zero array..")
-                raw = np.zeros((NRep, ncoils, NCol + heuristic_shift, 2))
-                raw = raw[:, :, :NCol, 0] + 1j * raw[:, :, :NCol, 1]
+                print(f"Try different nuber of coils (ncoils), maybe around {raw.size/(2*NRep*NRead + heuristic_shift*2*NRep)}.")
+                raw = np.zeros((NRep, ncoils, NRead + heuristic_shift, 2))
+                raw = raw[:, :, :NRead, 0] + 1j * raw[:, :, :NRead, 1]
             else:
-                raw = raw.reshape([NRep, ncoils, NCol + heuristic_shift, 2])
-                raw = raw[:, :, :NCol, 0] + 1j * raw[:, :, :NCol, 1]
+                raw = raw.reshape([NRep, ncoils, NRead + heuristic_shift, 2])
+                raw = raw[:, :, :NRead, 0] + 1j * raw[:, :, :NRead, 1]
 
-            # raw = raw.transpose([1,2,0]) #ncoils,NRep,NCol
-            raw = raw.transpose([0, 2, 1])  # NRep,NCol,NCoils
-            raw = raw.reshape([NRep * NCol, ncoils])
+            # raw = raw.transpose([1,2,0]) #ncoils,NRep,NRead
+            raw = raw.transpose([0, 2, 1])  # NRep,NRead,NCoils
+            raw = raw.reshape([NRep * NRead, ncoils])
             raw = np.copy(raw)
             done_flag = True
 
     return torch.tensor(raw, dtype=torch.complex64)
 
 
-def insert_signal_plot(seq: pp.Sequence, signal: np.ndarray):
+def insert_signal_plot(seq: pp.Sequence, signal: np.ndarray, ax=None):
     """Insert a measured signal into a currently open pypulseq plot.
 
     Usage:
@@ -78,6 +80,8 @@ def insert_signal_plot(seq: pp.Sequence, signal: np.ndarray):
     signal : np.ndarray
         The signal that should be inserted into the ADC plot.
         Has to have the same amount of samples as the sequence itself.
+    ax : matplotlib.axes.Axes | None
+        ADC axes to draw on. Defaults to the first axes of figure 1.
     """
     remaining_signal = signal.flatten().tolist()
     t0 = 0
@@ -98,23 +102,471 @@ def insert_signal_plot(seq: pp.Sequence, signal: np.ndarray):
         print("Can't insert signal into pulseq plot:")
         print("Signal and sequence have different amount of ADC samples.")
     else:
-        sp11 = plt.figure(1).get_axes()[0]
+        sp11 = ax if ax is not None else plt.figure(1).get_axes()[0]
 
         sp11.plot(time, np.abs(samples),  label='abs')
         sp11.plot(time, np.real(samples), label='real', linewidth=0.5)
         sp11.plot(time, np.imag(samples), label='imag', linewidth=0.5)
 
-        sp11.legend(loc='right', bbox_to_anchor=(1.12, 0.5), fontsize='xx-small')
+        sp11.legend(loc='upper right', bbox_to_anchor=(1.02, 1.0), fontsize='small')
 
 
-# This plot function is a modified version from the one provided by
-# pypulseq 1.2.0post1, all changes are marked
-# NOTE: the parameters have changed in the 1.4 version, maybe we should adapt them
+def _ensure_stacked_figsize(fig):
+    """Double figure height for a 6-row stacked plot, but only once."""
+    w, h = fig.get_size_inches()
+    if h / w < 1.2:
+        fig.set_size_inches(w, h * 2, forward=True)
+
+
+def _pulseq_plot_axes(figid=(1, 2), stacked=True, clear=False):
+    """Create or reuse sequence-plot axes.
+
+    stacked=True: one figure (figid[0]) with six shared-x rows
+    (ADC, RF mag, RF phase, Gx, Gy, Gz).
+    stacked=False: two 3-row figures (RF/ADC and gradients).
+    """
+    fig1 = plt.figure(figid[0])
+    if stacked:
+        _ensure_stacked_figsize(fig1)
+        if clear:
+            for ax in list(fig1.get_axes()):
+                ax.remove()
+        axes = fig1.get_axes()
+        if len(axes) == 6:
+            sp11, sp12, sp13, sp21, sp22, sp23 = axes[:6]
+        else:
+            for ax in list(axes):
+                ax.remove()
+            sp11 = fig1.add_subplot(611)
+            sp12 = fig1.add_subplot(612, sharex=sp11)
+            sp13 = fig1.add_subplot(613, sharex=sp11)
+            sp21 = fig1.add_subplot(614, sharex=sp11)
+            sp22 = fig1.add_subplot(615, sharex=sp11)
+            sp23 = fig1.add_subplot(616, sharex=sp11)
+        return fig1, fig1, (sp11, sp12, sp13), (sp21, sp22, sp23)
+
+    fig2 = plt.figure(figid[1])
+    fig1_axes = fig1.get_axes()
+    fig2_axes = fig2.get_axes()
+    if clear:
+        for ax in list(fig1_axes) + list(fig2_axes):
+            ax.remove()
+        fig1_axes = fig1.get_axes()
+        fig2_axes = fig2.get_axes()
+    if len(fig1_axes) == 3:
+        sp11, sp12, sp13 = fig1_axes[:3]
+    else:
+        for ax in list(fig1_axes):
+            ax.remove()
+        sp11 = fig1.add_subplot(311)
+        sp12 = fig1.add_subplot(312, sharex=sp11)
+        sp13 = fig1.add_subplot(313, sharex=sp11)
+    if len(fig2_axes) == 3:
+        sp21, sp22, sp23 = fig2_axes[:3]
+    else:
+        for ax in list(fig2_axes):
+            ax.remove()
+        sp21 = fig2.add_subplot(311, sharex=sp11)
+        sp22 = fig2.add_subplot(312, sharex=sp11)
+        sp23 = fig2.add_subplot(313, sharex=sp11)
+    return fig1, fig2, (sp11, sp12, sp13), (sp21, sp22, sp23)
+
+
 def pulseq_plot(seq: pp.Sequence,
                 type: Literal['Gradient', 'Kspace'] = 'Gradient',
                 time_range: tuple[float, float] = (0, np.inf),
                 time_disp: Literal['s', 'ms', 'us'] = 's',
-                clear=False, signal=0, figid=(1, 2)):
+                show_blocks=False,
+                clear=False, signal=None, figid=(1, 2),
+                stacked=True):
+    try:
+        signal=signal.numpy()
+    except:
+        signal=signal
+    try: 
+        version = f"{pp.Sequence.version_major}.{pp.Sequence.version_minor}.{pp.Sequence.version_revision}" # this works for 1.4
+    except:
+        try:
+            version=f"{pp.major}.{pp.minor}.{pp.revision}"  # this works for 1.3post1 and lower
+        except:
+            version=pp.__version__ # forgot in which version this worked, but here it is if everything else fails
+
+    version=float(version[:3]) # to float major.minor
+
+    if version >= 1.5:
+        # Native 1.5 plot already returns figure handles and supports clear/replot
+        print("plotting with pulseq 1.5")
+        sp_adc, t_adc = pulseq_plot_15(
+            seq=seq, time_range=time_range, time_disp=time_disp,
+            show_blocks=show_blocks, clear=clear, signal=signal, figid=figid,
+            plot_now=(signal is None), stacked=stacked,
+        )
+    elif version>=1.4:
+        # This works since pypulseq 1.4, which introduced the plot_now argument
+        print("plotting with pulseq 1.4")
+        if signal is None:
+            sp_adc, t_adc = pulseq_plot_142(
+                seq=seq, time_range=time_range, time_disp=time_disp,
+                show_blocks=show_blocks, figid=figid, stacked=stacked, clear=clear,
+            )
+        else:
+            sp_adc, t_adc = pulseq_plot_142(
+                seq=seq, plot_now=False, time_range=time_range, time_disp=time_disp,
+                show_blocks=show_blocks, figid=figid, stacked=stacked, clear=clear,
+            )
+            insert_signal_plot(seq, signal, ax=sp_adc)
+            plt.show()
+    else:
+        # This works for older pypulseq versions expect the newest dev branch
+        print("plotting with pulseq <=1.3")
+        sp_adc, t_adc = pulseq_plot_pre14(
+            seq=seq, time_range=time_range, time_disp=time_disp,
+            signal=signal, figid=figid, clear=clear, stacked=stacked,
+        )
+    
+    return sp_adc, t_adc
+
+
+def pulseq_plot_15(seq: pp.Sequence,
+                   time_range=(0, np.inf),
+                   time_disp: str = "s",
+                   show_blocks: bool = False,
+                   clear: bool = False,
+                   signal=None,
+                   figid=(1, 2),
+                   plot_now: bool = True,
+                   stacked=True):
+    """Thin wrapper around native pypulseq >= 1.5 `Sequence.plot()`.
+
+    pypulseq 1.5 already supports figure reuse (`clear`, `fig1` / `fig2`),
+    stacked one-figure layout, and ADC sample times via `Sequence.adc_times()`,
+    so this does not reimplement the plotter. Returns the ADC axes and `t_adc`
+    for compatibility with `pulseq_plot`.
+    """
+    if signal is not None:
+        plot_now = False
+
+    plot_kwargs = dict(
+        time_range=time_range,
+        time_disp=time_disp,
+        show_blocks=show_blocks,
+        plot_now=False,
+        clear=clear,
+    )
+
+    fig1 = plt.figure(figid[0])
+    fig2 = fig1 if stacked else plt.figure(figid[1])
+    if stacked:
+        _ensure_stacked_figsize(fig1)
+
+    plot_params = inspect.signature(seq.plot).parameters
+    if "stacked" in plot_params:
+        plot_kwargs["stacked"] = stacked
+
+    # Forward figure handles when the installed plot() accepts them (1.4.2.post / some 1.5)
+    if "fig1" in plot_params:
+        plot_kwargs["fig1"] = fig1
+        if "fig2" in plot_params and not stacked:
+            plot_kwargs["fig2"] = fig2
+        result = seq.plot(**plot_kwargs)
+    else:
+        # Official 1.5 SeqPlot API has no fig1/fig2; reuse pypulseq's own plot helper
+        try:
+            from pypulseq.utils.seq_plot import _seq_plot
+            result = _seq_plot(
+                seq,
+                label="",
+                save=False,
+                show_blocks=show_blocks,
+                time_range=time_range,
+                time_disp=time_disp,
+                grad_disp="kHz/m",
+                clear=clear,
+                fig1=fig1,
+                fig2=fig2,
+                stacked=stacked,
+            )
+        except (ImportError, TypeError):
+            result = seq.plot(**plot_kwargs)
+
+    if stacked:
+        stacked_fig = getattr(result, "fig1", None) or fig1
+        _ensure_stacked_figsize(stacked_fig)
+
+    if hasattr(result, "ax1"):
+        sp_adc = result.ax1[0]
+    elif isinstance(result, (tuple, list)) and len(result) >= 2:
+        axes1 = result[1]
+        sp_adc = axes1[0] if isinstance(axes1, (tuple, list)) else axes1
+    else:
+        sp_adc = plt.figure(figid[0]).get_axes()[0]
+
+    if hasattr(seq, "adc_times"):
+        if time_range == (0, np.inf):
+            t_adc, _ = seq.adc_times()
+        else:
+            t_adc, _ = seq.adc_times(time_range=list(time_range))
+    else:
+        t_adc = np.array([])
+
+    if signal is not None:
+        insert_signal_plot(seq, signal, ax=sp_adc)
+
+    if plot_now:
+        plt.show()
+
+    return sp_adc, t_adc
+
+# This plot function is a modified version from the one provided by
+# pypulseq 1.4.2, all changes are marked
+# NOTE: the parameters have changed in the 1.4 version, maybe we should adapt them
+def pulseq_plot_142(seq: pp.Sequence,
+        label: str = str(),
+        show_blocks: bool = False,
+        save: bool = False,
+        time_range=(0, np.inf),
+        time_disp: str = "s",
+        grad_disp: str = "kHz/m",
+        plot_now: bool = True,
+        figid=(1, 2),
+        stacked=True,
+        clear=False,
+    ) -> None:
+        """
+        Plot `Sequence`.
+
+        Parameters
+        ----------
+        label : str, defualt=str()
+            Plot label values for ADC events: in this example for LIN and REP labels; other valid labes are accepted as
+            a comma-separated list.
+        save : bool, default=False
+            Boolean flag indicating if plots should be saved. The two figures will be saved as JPG with numerical
+            suffixes to the filename 'seq_plot'.
+        show_blocks : bool, default=False
+            Boolean flag to indicate if grid and tick labels at the block boundaries are to be plotted.
+        time_range : iterable, default=(0, np.inf)
+            Time range (x-axis limits) for plotting the sequence. Default is 0 to infinity (entire sequence).
+        time_disp : str, default='s'
+            Time display type, must be one of `s`, `ms` or `us`.
+        grad_disp : str, default='s'
+            Gradient display unit, must be one of `kHz/m` or `mT/m`.
+        plot_now : bool, default=True
+            If true, function immediately shows the plots, blocking the rest of the code until plots are exited.
+            If false, plots are shown when plt.show() is called. Useful if plots are to be modified.
+        plot_type : str, default='Gradient'
+            Gradients display type, must be one of either 'Gradient' or 'Kspace'.
+        """
+        from pypulseq.supported_labels_rf_use import get_supported_labels
+        from pypulseq.calc_rf_center import calc_rf_center
+        from pypulseq.Sequence.sequence import cumsum
+        import math
+        import matplotlib as mpl
+
+
+        mpl.rcParams["lines.linewidth"] = 0.75  # Set default Matplotlib linewidth
+
+        valid_time_units = ["s", "ms", "us"]
+        valid_grad_units = ["kHz/m", "mT/m"]
+
+
+
+
+        valid_labels = get_supported_labels()
+        if (
+            not all([isinstance(x, (int, float)) for x in time_range])
+            or len(time_range) != 2
+        ):
+            raise ValueError("Invalid time range")
+        if time_disp not in valid_time_units:
+            raise ValueError("Unsupported time unit")
+
+        if grad_disp not in valid_grad_units:
+            raise ValueError(
+                "Unsupported gradient unit. Supported gradient units are: "
+                + str(valid_grad_units)
+            )
+
+        fig1, fig2, (sp11, sp12, sp13), fig2_subplots = _pulseq_plot_axes(
+            figid, stacked=stacked, clear=clear
+        )
+        t_factor_list = [1, 1e3, 1e6]
+        t_factor = t_factor_list[valid_time_units.index(time_disp)]
+
+        g_factor_list = [1e-3, 1e3 / seq.system.gamma]
+        g_factor = g_factor_list[valid_grad_units.index(grad_disp)]
+
+        t0 = 0
+        t_adc = [] # >>>> Changed: store adc samples <<<<
+        label_defined = False
+        label_idx_to_plot = []
+        label_legend_to_plot = []
+        label_store = dict()
+        for i in range(len(valid_labels)):
+            label_store[valid_labels[i]] = 0
+            if valid_labels[i] in label.upper():
+                label_idx_to_plot.append(i)
+                label_legend_to_plot.append(valid_labels[i])
+
+        if len(label_idx_to_plot) != 0:
+            p = parula.main(len(label_idx_to_plot) + 1)
+            label_colors_to_plot = p(np.arange(len(label_idx_to_plot)))
+            cycler = mpl.cycler(color=label_colors_to_plot)
+            sp11.set_prop_cycle(cycler)
+
+
+        # Block timings
+        block_edges = np.cumsum([0] + [x[1] for x in sorted(seq.block_durations.items())])
+        block_edges_in_range = block_edges[
+            (block_edges >= time_range[0]) * (block_edges <= time_range[1])
+        ]
+        if show_blocks:
+            for sp in [sp11, sp12, sp13, *fig2_subplots]:
+                sp.set_xticks(t_factor * block_edges_in_range)
+                sp.set_xticklabels(sp.get_xticklabels(), rotation=90)
+
+        for block_counter in seq.block_events:
+            block = seq.get_block(block_counter)
+            is_valid = (time_range[0] <= t0 + seq.block_durations[block_counter]
+                        and t0 <= time_range[1])
+            if is_valid:
+                if getattr(block, "label", None) is not None:
+                    for i in range(len(block.label)):
+                        if block.label[i].type == "labelinc":
+                            label_store[block.label[i].label] += block.label[i].value
+                        else:
+                            label_store[block.label[i].label] = block.label[i].value
+                    label_defined = True
+
+                if getattr(block, "adc", None) is not None:  # ADC
+                    adc = block.adc
+                    # From Pulseq: According to the information from Klaus Scheffler and indirectly from Siemens this
+                    # is the present convention - the samples are shifted by 0.5 dwell
+                    t = adc.delay + (np.arange(int(adc.num_samples)) + 0.5) * adc.dwell
+                    sp11.plot(t_factor * (t0 + t), np.zeros(len(t)), "rx")
+                    
+                    t_adc = np.append(t_adc, t0 + t) # >>>> Changed: store adc samples <<<<
+                    sp13.plot(
+                        t_factor * (t0 + t),
+                        np.angle(
+                            np.exp(1j * adc.phase_offset)
+                            * np.exp(1j * 2 * np.pi * t * adc.freq_offset)
+                        ),
+                        "b.",
+                        markersize=0.25,
+                    )
+
+                    if label_defined and len(label_idx_to_plot) != 0:
+                        arr_label_store = list(label_store.values())
+                        lbl_vals = np.take(arr_label_store, label_idx_to_plot)
+                        t = t0 + adc.delay + (adc.num_samples - 1) / 2 * adc.dwell
+                        _t = [t_factor * t] * len(lbl_vals)
+                        # Plot each label individually to retrieve each corresponding Line2D object
+                        p = itertools.chain.from_iterable(
+                            [
+                                sp11.plot(__t, _lbl_vals, ".")
+                                for __t, _lbl_vals in zip(_t, lbl_vals)
+                            ]
+                        )
+                        if len(label_legend_to_plot) != 0:
+                            sp11.legend(p, label_legend_to_plot, loc="upper left")
+                            label_legend_to_plot = []
+
+                if getattr(block, "rf", None) is not None:  # RF
+                    rf = block.rf
+                    tc, ic = calc_rf_center(rf)
+                    time = rf.t
+                    signal = rf.signal
+                    if abs(signal[0]) != 0:
+                        signal = np.concatenate(([0], signal))
+                        time = np.concatenate(([time[0]], time))
+                        ic += 1
+
+                    if abs(signal[-1]) != 0:
+                        signal = np.concatenate((signal, [0]))
+                        time = np.concatenate((time, [time[-1]]))
+
+                    sp12.plot(t_factor * (t0 + time + rf.delay), np.abs(signal))
+                    sp13.plot(
+                        t_factor * (t0 + time + rf.delay),
+                        np.angle(
+                            signal
+                            * np.exp(1j * rf.phase_offset)
+                            * np.exp(1j * 2 * math.pi * time * rf.freq_offset)
+                        ),
+                        t_factor * (t0 + tc + rf.delay),
+                        np.angle(
+                            signal[ic]
+                            * np.exp(1j * rf.phase_offset)
+                            * np.exp(1j * 2 * math.pi * time[ic] * rf.freq_offset)
+                        ),
+                        "xb",
+                    )
+
+                grad_channels = ["gx", "gy", "gz"]
+                for x in range(len(grad_channels)):  # Gradients
+                    if getattr(block, grad_channels[x], None) is not None:
+                        grad = getattr(block, grad_channels[x])
+                        if grad.type == "grad":
+                            # We extend the shape by adding the first and the last points in an effort of making the
+                            # display a bit less confusing...
+                            time = grad.delay + np.array([0, *grad.tt, grad.shape_dur])
+                            waveform = g_factor * np.array(
+                                (grad.first, *grad.waveform, grad.last)
+                            )
+                        else:
+                            time = np.array(cumsum(
+                                    0,
+                                    grad.delay,
+                                    grad.rise_time,
+                                    grad.flat_time,
+                                    grad.fall_time,
+                            ))
+                            waveform = (
+                                g_factor * grad.amplitude * np.array([0, 0, 1, 1, 0])
+                            )
+                        fig2_subplots[x].plot(t_factor * (t0 + time), waveform)
+            t0 += seq.block_durations[block_counter]
+
+        grad_plot_labels = ["x", "y", "z"]
+        sp11.set_ylabel("ADC")
+        sp12.set_ylabel("RF mag (Hz)")
+        sp13.set_ylabel("RF/ADC phase (rad)")
+        sp13.set_xlabel(f"t ({time_disp})")
+        for x in range(3):
+            _label = grad_plot_labels[x]
+            fig2_subplots[x].set_ylabel(f"G{_label} ({grad_disp})")
+        fig2_subplots[-1].set_xlabel(f"t ({time_disp})")
+
+        # Setting display limits
+        disp_range = t_factor * np.array([time_range[0], min(t0, time_range[1])])
+        [x.set_xlim(disp_range) for x in [sp11, sp12, sp13, *fig2_subplots]]
+
+        # Grid on
+        for sp in [sp11, sp12, sp13, *fig2_subplots]:
+            sp.grid()
+
+        fig1.tight_layout()
+        if fig2 is not fig1:
+            fig2.tight_layout()
+        if save:
+            fig1.savefig("seq_plot1.jpg")
+            if fig2 is not fig1:
+                fig2.savefig("seq_plot2.jpg")
+
+        if plot_now:
+            plt.show()
+
+        return sp11, t_adc
+
+# This plot function is a modified version from the one provided by
+# pypulseq 1.2.0post1, all changes are marked
+# NOTE: the parameters have changed in the 1.4 version, maybe we should adapt them
+def pulseq_plot_pre14(seq: pp.Sequence,
+                type: Literal['Gradient', 'Kspace'] = 'Gradient',
+                time_range: tuple[float, float] = (0, np.inf),
+                time_disp: Literal['s', 'ms', 'us'] = 's',
+                clear=False, signal=0, figid=(1, 2), stacked=True):
     """Modified pypulseq Sequence.plot() that includes an ADC signal.
 
     Parameters
@@ -137,42 +589,9 @@ def pulseq_plot(seq: pp.Sequence,
     if time_disp not in valid_time_units:
         raise Exception()
 
-    fig1, fig2 = plt.figure(figid[0]), plt.figure(figid[1])
-
-# >>>> This is changed compared to pypulseq 1.2
-    fig1_sp_list = fig1.get_axes()
-    fig2_sp_list = fig2.get_axes()
-
-    if clear:
-        for ax in fig1_sp_list + fig2_sp_list:
-            ax.remove()
-        fig1_sp_list = fig1.get_axes()
-        fig2_sp_list = fig2.get_axes()
-
-    if len(fig1_sp_list) == 3:
-        (sp11, sp12, sp13) = fig1_sp_list
-    else:
-        for ax in fig1_sp_list:
-            ax.remove()
-
-        # These 3 subplots are unchanged from pypulseq 1.2
-        sp11 = fig1.add_subplot(311)
-        sp12 = fig1.add_subplot(312, sharex=sp11)
-        sp13 = fig1.add_subplot(313, sharex=sp11)
-
-    if len(fig2_sp_list) == 3:
-        fig2_sp_list = fig2_sp_list
-    else:
-        for ax in fig2_sp_list:
-            ax.remove()
-
-        # This is also straight from pypulseq 1.2
-        fig2_sp_list = [
-            fig2.add_subplot(311, sharex=sp11),
-            fig2.add_subplot(312, sharex=sp11),
-            fig2.add_subplot(313, sharex=sp11)
-        ]
-# <<<< End of change
+    fig1, fig2, (sp11, sp12, sp13), fig2_sp_list = _pulseq_plot_axes(
+        figid, stacked=stacked, clear=clear
+    )
 
     t_factor_list = [1, 1e3, 1e6]
     t_factor = t_factor_list[valid_time_units.index(time_disp)]
@@ -322,6 +741,9 @@ def imshow(data: Union[np.ndarray, torch.Tensor], *args, **kwargs):
     data as a grid of slices. Also prints x-axis horizontal and y vertiacl.
     
     Assumes data to be indexed [c, x, y, z]"""
+    # Handle negative strides by making a copy if needed
+    if isinstance(data, np.ndarray) and data.strides and any(s < 0 for s in data.strides):
+        data = data.copy()
     data = torch.as_tensor(data).detach().cpu()
     assert 2 <= data.ndim <= 4
 
@@ -341,7 +763,7 @@ def imshow(data: Union[np.ndarray, torch.Tensor], *args, **kwargs):
             y = ((rows * cols - i - 1) // cols)*tmp.shape[1]
             data[x:x+tmp.shape[0], y:y+tmp.shape[1]] = tmp[:, :, i]
 
-    plt.imshow(data.T, *args, origin="lower", **kwargs)
+    return plt.imshow(data.T, *args, origin="lower", **kwargs)
 
 
 DEFAULT_PHANTOM_URL = "https://github.com/MRsources/MRzero-Core/raw/main/documentation/playground_mr0/numerical_brain_cropped.mat"

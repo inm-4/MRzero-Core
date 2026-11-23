@@ -1,9 +1,10 @@
 /target
-/documentation/_autosummary
-/documentation/_build
+/documentation/book
 out/
 *.seq
 *.env
+*.ipynb_checkpoints
+uv.lock
 
 *.pdf
 
@@ -85,3 +86,12 @@ docs/_build/
 
 # Pyenv
 .python-version
+
+# keep test seq files
+!tests/simulation_test/seq_files/*.seq
+
+# cursor files
+.cursor/
+
+# test venv
+.test_venv/

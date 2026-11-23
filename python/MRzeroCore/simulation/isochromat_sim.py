@@ -70,10 +70,10 @@ def isochromat_sim(seq: Sequence, data: SimData, spin_count: int,
         voxel_size = torch.tensor([0.1, 0.1, 0.1], device=data.device)
 
     if spin_dist == "rand":
-        spin_pos = torch.rand(spin_count, 3)
+        spin_pos = torch.rand(spin_count, 3, device=data.device)
     elif spin_dist == "r2":
         if r2_seed is None:
-            r2_seed = torch.rand(3)
+            r2_seed = torch.rand(3, device=data.device)
 
         # 3 dimensional R2 sequence for intravoxel spin distribution
         g = 1.22074408460575947536  # 3D
@@ -127,8 +127,8 @@ def isochromat_sim(seq: Sequence, data: SimData, spin_count: int,
         # we accumulate a lot of error. Instead, calculate it relative to the
         # state immedeately after the pulse for every event
         spins_start = spins
-        time = rep.event_time.cumsum(0)
-        gradm = rep.gradm.cumsum(0)
+        time = rep.event_time.cumsum(0).to(device=data.device)
+        gradm = rep.gradm.cumsum(0).to(device=data.device)
 
         for e in range(rep.event_count):
             spins = spins_start.clone()
@@ -211,7 +211,7 @@ def flip(spins: torch.Tensor, angle: torch.Tensor, phase: torch.Tensor,
 def grad_precess(spins: torch.Tensor, gradm: torch.Tensor,
                  voxel_pos: torch.Tensor) -> torch.Tensor:
     """Rotate individual voxels as given by their position and ```gradm``."""
-    angle = 2 * pi * voxel_pos @ gradm  # shape: voxels
+    angle = -2 * pi * voxel_pos @ gradm  # shape: voxels
     rot_mat = torch.zeros((angle.numel(), 3, 3), device=spins.device)
     rot_mat[:, 0, 0] = torch.cos(angle)
     rot_mat[:, 0, 1] = -torch.sin(angle)
@@ -225,7 +225,7 @@ def grad_precess(spins: torch.Tensor, gradm: torch.Tensor,
 def B0_precess(spins: torch.Tensor, B0: torch.Tensor,
                dt: float) -> torch.Tensor:
     """Rotate voxels as given by ``B0`` and the elapsed time ``dt``."""
-    angle = 2 * pi * B0 * dt  # shape: voxels
+    angle = -2 * pi * B0 * dt  # shape: voxels
     rot_mat = torch.zeros((angle.numel(), 3, 3), device=spins.device)
     rot_mat[:, 0, 0] = torch.cos(angle)
     rot_mat[:, 0, 1] = -torch.sin(angle)
@@ -243,7 +243,7 @@ def intravoxel_precess(spins: torch.Tensor, gradm: torch.Tensor,
     ``grad_precess`` and ``intravoxel_precess`` are both needed to correctly
     simulate the effect gradients have on the magnetisation.
     """
-    angle = spin_pos @ gradm  # shape: spins
+    angle = -spin_pos @ gradm  # shape: spins
     rot_mat = torch.zeros((angle.numel(), 3, 3), device=spins.device)
     rot_mat[:, 0, 0] = torch.cos(angle)
     rot_mat[:, 0, 1] = -torch.sin(angle)
